@@ -1,0 +1,36 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # 允许在 GitHub 网页上手动点击按钮触发打包
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 配置 Python 环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: 安装打包依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install duckdb requests beautifulsoup4 huggingface_hub pandas pyinstaller
+
+    - name: 使用 PyInstaller 打包成单文件 EXE
+      run: |
+        # 将 --onedir 替换为 --onefile (单文件模式)
+        pyinstaller --noconfirm --onefile --console --name "MarkTool" --hidden-import="duckdb" setup.py
+
+    - name: 上传打包产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: MarkTool_Windows_Build
+        # 单文件模式下，产物直接就是 dist/ 下的单个 .exe
+        path: dist/MarkTool.exe
