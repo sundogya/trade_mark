@@ -17,6 +17,7 @@ else:
 DB_DIR = os.path.join(BASE_DIR, "db")
 DB_PATH = os.path.join(DB_DIR, "uspto_trademarks.duckdb")
 ARCHIVE_PATH = os.path.join(BASE_DIR, "uspto_trademarks.tar.xz")
+CSV_DIR = os.path.join(BASE_DIR, "csv")  # 统一导出目录
 
 def wait_for_exit(message="\n按任意键退出程序..."):
     """跨平台友好退出，防止 Windows 下双击 exe 报错一闪而过"""
@@ -56,7 +57,6 @@ def ensure_database_ready():
     print(" 正在执行解压操作（解压可能需要 1~2 分钟，请稍候）...")
 
     try:
-        # 解压到 BASE_DIR
         with tarfile.open(ARCHIVE_PATH, "r:xz") as tar:
             tar.extractall(path=BASE_DIR)
         print(" 数据解压完成！")
@@ -80,9 +80,10 @@ def getText(html, text=''):
         res = tag.text.strip().replace('\r', '').replace('\n', ' ').replace('\t', '')
     return res
 
-def query_duckdb_by_range(start_val, end_val, export_csv=True):
+def query_duckdb_by_range(start_val, end_val, export_csv=True, chunk_size=2000):
     """
-    选项 1：直接从 db/uspto_trademarks.duckdb 按编号范围毫秒级检索，并可选择导出 CSV
+    选项 1：从 db/uspto_trademarks.duckdb 检索数据
+    优化：以 chunk_size (默认 2000) 条为一组分卷导出到 csv/ 目录下
     """
     if not os.path.exists(DB_PATH):
         print(f"❌ 找不到数据库文件: {DB_PATH}")
@@ -130,13 +131,30 @@ def query_duckdb_by_range(start_val, end_val, export_csv=True):
             print("---------------------------\n")
 
             if export_csv:
-                output_file = os.path.join(BASE_DIR, f"{start_val}_{end_val}.csv")
-                df.to_csv(output_file, index=False, encoding='utf-8-sig')
-                print(f" 数据已导出至 CSV: {output_file}")
+                os.makedirs(CSV_DIR, exist_ok=True)
+                total_parts = (total_rows + chunk_size - 1) // chunk_size
+
+                print(f"正在导出 CSV（每组 {chunk_size} 条，共计 {total_parts} 个文件）...")
+                for part_idx in range(total_parts):
+                    start_i = part_idx * chunk_size
+                    end_i = min(start_i + chunk_size, total_rows)
+                    chunk_df = df.iloc[start_i:end_i]
+
+                    # 仅一个文件时直接命名，多文件时追加 part 序号
+                    if total_parts == 1:
+                        filename = f"{start_val}_{end_val}.csv"
+                    else:
+                        filename = f"{start_val}_{end_val}_part{part_idx + 1}.csv"
+
+                    filepath = os.path.join(CSV_DIR, filename)
+                    chunk_df.to_csv(filepath, index=False, encoding='utf-8-sig')
+                    print(f" [{part_idx + 1}/{total_parts}] 已导出: csv/{filename} ({len(chunk_df)} 条)")
+
+                print(f"\n 全部 CSV 已成功保存至目录: {CSV_DIR}")
         else:
             print("该区间内未查询到匹配记录。")
     except Exception as e:
-        print(f"查询出错: {e}")
+        print(f"查询或导出出错: {e}")
     finally:
         con.close()
 
@@ -219,166 +237,22 @@ def update_duckdb_trademarks(serial_numbers):
     con.close()
     print(f"\n全部执行完毕！成功更新回写 DuckDB: {updated_count} 条。")
 
-def update_from_huggingface(repo_id, filename, hf_token=None):
-    """
-    选项 3：从 Hugging Face 社区下载增量文件并合并进 db/uspto_trademarks.duckdb
-    """
-    os.makedirs(DB_DIR, exist_ok=True)
-
-    print(f"\n[1/3] 正在从 Hugging Face 仓库 ({repo_id}) 下载增量文件: {filename} ...")
-    try:
-        local_file_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            repo_type="dataset",
-            token=hf_token
-        )
-        print(f" 文件已准备就绪: {local_file_path}")
-    except Exception as e:
-        print(f"❌ Hugging Face 下载失败: {e}")
-        return
-
-    con = duckdb.connect(DB_PATH)
-
-    print("\n[2/3] 检查数据库与目标表结构...")
-    con.execute("""
-    CREATE TABLE IF NOT EXISTS trademarks (
-        mark VARCHAR,
-        us_serial_number VARCHAR PRIMARY KEY,
-        us_registration_number VARCHAR,
-        application_filing_date DATE,
-        registration_date DATE,
-        publication_date DATE,
-        status_code VARCHAR,
-        status_date DATE,
-        for_goods_services VARCHAR,
-        international_classes VARCHAR,
-        owner_name VARCHAR,
-        owner_address VARCHAR,
-        legal_entity_type VARCHAR,
-        state_or_country_where_organized VARCHAR,
-        attorney_name VARCHAR,
-        docket_number VARCHAR,
-        attorney_primary_email_address VARCHAR,
-        attorney_email_authorized VARCHAR,
-        correspondent_name_address VARCHAR,
-        correspondent_phone VARCHAR,
-        correspondent_email VARCHAR,
-        correspondent_email_authorized VARCHAR,
-        earliest_date_can_be_filed DATE,
-        latest_date_without_additional_fee DATE,
-        latest_date_with_additional_fee DATE
-    );
-    """)
-
-    if local_file_path.endswith('.parquet'):
-        read_expr = f"read_parquet('{local_file_path}')"
-    else:
-        read_expr = f"read_csv_auto('{local_file_path}', header=True)"
-
-    print("\n[3/3] 正在执行增量合入与排重写入 (包含 for_goods_services)...")
-    con.execute(f"""
-    CREATE OR REPLACE TEMP TABLE temp_hf_incoming AS
-    SELECT 
-        COALESCE(COLUMNS('(?i)mark.*'), NULL)                                       AS mark,
-        CAST(COALESCE(COLUMNS('(?i)(us_)?serial(_no|_number)?'), NULL) AS VARCHAR)  AS us_serial_number,
-        CAST(COALESCE(COLUMNS('(?i)(us_)?reg(istration)?(_no|_number)?'), NULL) AS VARCHAR) AS us_registration_number,
-        TRY_CAST(COALESCE(COLUMNS('(?i)(app.*filing|filing).*dt.*'), NULL) AS DATE) AS application_filing_date,
-        TRY_CAST(COALESCE(COLUMNS('(?i)reg.*dt.*'), NULL) AS DATE)                  AS registration_date,
-        TRY_CAST(COALESCE(COLUMNS('(?i)pub.*dt.*'), NULL) AS DATE)                  AS publication_date,
-        CAST(COALESCE(COLUMNS('(?i)status(_cd|_code)?'), NULL) AS VARCHAR)          AS status_code,
-        TRY_CAST(COALESCE(COLUMNS('(?i)status.*dt.*'), NULL) AS DATE)               AS status_date,
-        CAST(COALESCE(COLUMNS('(?i)(for.*|statement.*text|goods.*service.*)'), NULL) AS VARCHAR) AS for_goods_services,
-        CAST(COALESCE(COLUMNS('(?i)(intl_class.*|international.*)'), NULL) AS VARCHAR) AS international_classes,
-        CAST(COALESCE(COLUMNS('(?i)own.*name.*'), NULL) AS VARCHAR)                 AS owner_name,
-        CAST(COALESCE(COLUMNS('(?i)own.*addr.*'), NULL) AS VARCHAR)                 AS owner_address,
-        CAST(COALESCE(COLUMNS('(?i)legal.*entity.*'), NULL) AS VARCHAR)             AS legal_entity_type,
-        CAST(COALESCE(COLUMNS('(?i)(state.*country|citizenship).*'), NULL) AS VARCHAR) AS state_or_country_where_organized,
-        CAST(COALESCE(COLUMNS('(?i)attorney.*name.*'), NULL) AS VARCHAR)            AS attorney_name,
-        CAST(COALESCE(COLUMNS('(?i)cor.*(addr|name).*'), NULL) AS VARCHAR)          AS correspondent_name_address
-    FROM {read_expr}
-    WHERE us_serial_number IS NOT NULL;
-    """)
-
-    con.execute("""
-    INSERT OR REPLACE INTO trademarks (
-        mark,
-        us_serial_number,
-        us_registration_number,
-        application_filing_date,
-        registration_date,
-        publication_date,
-        status_code,
-        status_date,
-        for_goods_services,
-        international_classes,
-        owner_name,
-        owner_address,
-        legal_entity_type,
-        state_or_country_where_organized,
-        attorney_name,
-        correspondent_name_address,
-        earliest_date_can_be_filed,
-        latest_date_without_additional_fee,
-        latest_date_with_additional_fee
-    )
-    SELECT 
-        mark,
-        us_serial_number,
-        us_registration_number,
-        application_filing_date,
-        registration_date,
-        publication_date,
-        status_code,
-        status_date,
-        for_goods_services,
-        international_classes,
-        owner_name,
-        owner_address,
-        legal_entity_type,
-        state_or_country_where_organized,
-        attorney_name,
-        correspondent_name_address,
-        registration_date + INTERVAL 5 YEAR,
-        registration_date + INTERVAL 6 YEAR,
-        registration_date + INTERVAL 6 YEAR + INTERVAL 6 MONTH
-    FROM temp_hf_incoming;
-    """)
-
-    con.execute("CHECKPOINT;")
-    incoming_count = con.execute("SELECT COUNT(*) FROM temp_hf_incoming").fetchone()[0]
-    total_count = con.execute("SELECT COUNT(*) FROM trademarks").fetchone()[0]
-    con.close()
-
-    print(f"\n🎉 增量同步完成！本次吸纳/更新: {incoming_count} 条，数据库当前总量: {total_count} 条。")
-
 # 命令行交互主入口
 if __name__ == "__main__":
-    # 启动时首先检测数据库环境是否就绪，没有则触发自动解压流程
     ensure_database_ready()
 
     choice = input('请选择操作模式：\n'
-                   '1、根据最大/最小值从 DuckDB 检索并导出 CSV\n'
+                   '1、根据最大/最小值从 DuckDB 检索并按2000条分组导出 CSV\n'
                    '2、从网络抓取最新数据并更新回写进 DuckDB\n'
-                   '3、从 Hugging Face 下载增量包合并进 DuckDB\n'
-                   '请输入选项 (1/2/3): ').strip()
+                   '请输入选项 (1/2): ').strip()
 
     if choice == '1':
         start = input('请输入最小值（如 90000000）: \n').strip()
-        end = input('请输入最大值（如 90001000）: \n').strip()
-        query_duckdb_by_range(start, end)
+        end = input('请输入最大值（如 90005000）: \n').strip()
+        query_duckdb_by_range(start, end, chunk_size=2000)
     elif choice == '2':
         data = input('请输入需要在线更新的商标申请号（多个用英文逗号隔开，如 98689327,90007611）: \n').strip()
         rows = data.split(',')
         update_duckdb_trademarks(rows)
-    # elif choice == '3':
-    #     default_repo = "illeatmyhat/uspto-trademarks"
-    #     default_file = "data/case_file/latest.parquet"
-
-    #     repo = input(f"请输入 Hugging Face 数据集 Repo (直接回车默认: {default_repo}): \n").strip() or default_repo
-    #     file_name = input(f"请输入仓库中的文件名 (直接回车默认: {default_file}): \n").strip() or default_file
-    #     token = input("如果仓库是私有的，请输入 HF Token (公开仓库直接回车): \n").strip() or None
-
-    #     update_from_huggingface(repo_id=repo, filename=file_name, hf_token=token)
     else:
         print("无效选项，退出程序。")
