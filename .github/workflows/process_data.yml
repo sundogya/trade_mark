@@ -16,16 +16,16 @@ jobs:
 
       - name: 清理 Runner 磁盘空间 (防止处理大文件时磁盘写满)
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android &
+          sudo rm -rf /usr/share/dotnet &
+          sudo rm -rf /opt/ghc &
+          wait
           df -h
 
       - name: 配置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: 安装依赖
         run: |
