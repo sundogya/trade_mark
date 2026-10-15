@@ -8,8 +8,6 @@ import os
 import sys
 import argparse
 
-from setup_bak import BASE_DIR
-
 def main():
     parser = argparse.ArgumentParser(description="从 Hugging Face 镜像下载 USPTO 商标全量数据集")
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
