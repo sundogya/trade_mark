@@ -1,0 +1,71 @@
+name: USPTO Data Pipeline & Package
+
+on:
+  workflow_dispatch: # 支持在 GitHub 网页一键手动触发
+  workflow_call:
+  schedule:
+    - cron: '0 0 1 * *' # 可选：每月 1 号 UTC 0:00 自动运行
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 清理 Runner 磁盘空间 (防止处理大文件时磁盘写满)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb huggingface_hub pandas requests beautifulsoup4
+
+      - name: 步骤 1 - 下载 Parquet 数据 (download.py)
+        run: |
+          # 处于海外 GitHub 环境，无需走镜像源直连下载
+          python src/download.py
+
+      - name: 步骤 2 - 转换为初始 DuckDB (to_duckdb_2.py)
+        run: |
+          python src/to_duckdb_2.py
+
+      - name: 步骤 3 - 修复 For 字段 (fixe_for.py)
+        run: |
+          python src/fixe_for.py
+
+      - name: 步骤 4 - 数据库脱水瘦身 (tiny_db.py)
+        run: |
+          python src/tiny_db.py
+
+      - name: 步骤 5 - 数据库切片 (split_db.py)
+        run: |
+          python src/split_db.py
+
+      - name: 步骤 6 - 多线程高压缩打包 (tar.xz)
+        run: |
+          # 检查生成切片的目录结构并进行并行压缩
+          # 如果你的切片存放在 db/split_files/，将路径对应即可
+          if [ -d "db/split_files" ]; then
+            tar -cf - db/split_files/*.duckdb | xz -T0 -8 > uspto_trademarks.tar.xz
+          else
+            tar -cf - db/*.duckdb | xz -T0 -8 > uspto_trademarks.tar.xz
+          fi
+          ls -lh uspto_trademarks.tar.xz
+
+      - name: 暂存数据压缩包产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-archive
+          path: uspto_trademarks.tar.xz

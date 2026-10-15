@@ -8,12 +8,16 @@ import os
 import sys
 import argparse
 
+from setup_bak import BASE_DIR
+
 def main():
     parser = argparse.ArgumentParser(description="从 Hugging Face 镜像下载 USPTO 商标全量数据集")
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    DEFAULT_OUTPUT = os.path.join(BASE_DIR, "uspto_trademarks_data")
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./uspto_trademarks_data",
+        default=DEFAULT_OUTPUT,
         help="数据保存的本地目录路径 (默认: ./uspto_trademarks_data)"
     )
     parser.add_argument(
@@ -25,8 +29,8 @@ def main():
     parser.add_argument(
         "--use_mirror",
         action="store_true",
-        default=True,
-        help="是否启用国内加速镜像源 hf-mirror.com (默认开启)"
+        default=False,
+        help="是否启用国内加速镜像源 hf-mirror.com (默认关闭)"
     )
     parser.add_argument(
         "--workers",

@@ -1,9 +1,8 @@
 name: Build Windows EXE
 
 on:
-  push:
-    branches: [ "main", "master" ]
   workflow_dispatch: # 允许在 GitHub 网页上手动点击按钮触发打包
+  workflow_call: # 允许其他工作流调用此工作流
 
 jobs:
   build:
@@ -31,6 +30,6 @@ jobs:
     - name: 上传打包产物
       uses: actions/upload-artifact@v4
       with:
-        name: MarkTool_Windows_Build
+        name: windows-exe
         # 单文件模式下，产物直接就是 dist/ 下的单个 .exe
         path: dist/MarkTool.exe

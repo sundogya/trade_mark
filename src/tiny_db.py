@@ -1,8 +1,10 @@
 import duckdb
 import os
-
-src_db = "db/uspto_trademarks.duckdb"
-compact_db = "db/uspto_trademarks_clean.duckdb"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+src_db = os.path.join(BASE_DIR, "db", "uspto_trademarks.duckdb")
+compact_db = os.path.join(BASE_DIR, "db", "uspto_trademarks_clean.duckdb")
+# src_db = "db/uspto_trademarks.duckdb"
+# compact_db = "db/uspto_trademarks_clean.duckdb"
 
 print("正在对 15GB+ 数据库进行物理脱水与空间回收...")
 con = duckdb.connect()

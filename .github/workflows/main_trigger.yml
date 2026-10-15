@@ -1,0 +1,54 @@
+name: 🚀 一键打包 (处理数据 + EXE打包 + 合并ZIP)
+
+on:
+  workflow_dispatch: # 手动一键触发
+
+jobs:
+  # 1. 运行数据处理工作流 (Linux)
+  call-data-pipeline:
+    uses: ./.github/workflows/process_data.yml
+
+  # 2. 运行 EXE 打包工作流 (Windows)
+  call-exe-builder:
+    uses: ./.github/workflows/build_window_exe.yml
+
+  # 3. 收集两边的产物放到同一个目录并打包为 ZIP
+  bundle-and-zip:
+    needs: [call-data-pipeline, call-exe-builder] # 必须等上面两个任务都成功才执行
+    runs-on: ubuntu-latest
+    steps:
+      - name: 创建打包目标目录
+        run: |
+          mkdir -p USPTO_Tool_Package
+
+      - name: 下载 EXE 文件
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: USPTO_Tool_Package
+
+      - name: 下载数据压缩包
+        uses: actions/download-artifact@v4
+        with:
+          name: data-archive
+          path: USPTO_Tool_Package
+
+      - name: 查看合并后的目录并打成 ZIP 包
+        run: |
+          echo "=== 查看合并目录内容 ==="
+          ls -lh USPTO_Tool_Package/
+          
+          # 打包该目录下的所有文件为单个 ZIP
+          zip -r USPTO_Tool_Full.zip USPTO_Tool_Package/
+          
+          ls -lh USPTO_Tool_Full.zip
+
+      - name: 发布到 GitHub Release (可直接在网页下载该 ZIP)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "release-${{ github.run_id }}"
+          name: "USPTO Tool 完整发布包 (Build ${{ github.run_id }})"
+          body: "包含合并打包后的 ZIP 文件（内含 MarkTool.exe 与 uspto_trademarks.tar.xz）"
+          files: USPTO_Tool_Full.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

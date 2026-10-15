@@ -2,8 +2,17 @@ import os
 import shutil
 import duckdb
 
-DB_PATH = "db/uspto_trademarks.duckdb"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# DB_PATH = "db/uspto_trademarks.duckdb"
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# DATA_DIR = os.path.join(BASE_DIR, "uspto_trademarks_data", "data")
+# TEMP_DIR = os.path.join(BASE_DIR, ".duckdb_temp")
+
+# os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# os.makedirs(TEMP_DIR, exist_ok=True)
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "db", "uspto_trademarks.duckdb")
 DATA_DIR = os.path.join(BASE_DIR, "uspto_trademarks_data", "data")
 TEMP_DIR = os.path.join(BASE_DIR, ".duckdb_temp")
 
