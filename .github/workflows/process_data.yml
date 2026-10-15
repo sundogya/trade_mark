@@ -58,9 +58,9 @@ jobs:
           # 检查生成切片的目录结构并进行并行压缩
           # 如果你的切片存放在 db/split_files/，将路径对应即可
           if [ -d "db/split_files" ]; then
-            tar -cf - db/split_files/*.duckdb | xz -T0 -8 > uspto_trademarks.tar.xz
+            tar -cf - db/split_files/*.duckdb | xz -T0 -6 > uspto_trademarks.tar.xz
           else
-            tar -cf - db/*.duckdb | xz -T0 -8 > uspto_trademarks.tar.xz
+            tar -cf - db/*.duckdb | xz -T0 -6 > uspto_trademarks.tar.xz
           fi
           ls -lh uspto_trademarks.tar.xz
 
