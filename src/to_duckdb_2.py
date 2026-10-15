@@ -29,7 +29,7 @@ con = duckdb.connect(DB_PATH)
 con.execute(f"SET temp_directory='{TEMP_DIR}';")
 con.execute("SET preserve_insertion_order=false;")
 con.execute("SET threads=1;")
-con.execute("SET memory_limit='16GB';")
+con.execute("SET memory_limit='5GB';")
 
 # -------------------------------------------------------------------------
 # [第 1 步] 提取商品服务声明 (statement)
