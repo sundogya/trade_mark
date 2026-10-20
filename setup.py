@@ -148,7 +148,7 @@ def query_by_serial_range(start_val, end_val, chunk_size=4000):
         status_code, status_date, for_goods_services, international_classes,
         owner_name, owner_address, legal_entity_type,
         state_or_country_where_organized, attorney_name,
-        correspondent_name_address, earliest_date_can_be_filed,
+        correspondent_name_address, correspondent_email, earliest_date_can_be_filed,
         latest_date_without_additional_fee
     FROM trademarks
     WHERE us_serial_number >= ? AND us_serial_number <= ?
@@ -186,7 +186,7 @@ def query_by_mark_keyword(keyword, chunk_size=4000):
         status_code, status_date, for_goods_services, international_classes,
         owner_name, owner_address, legal_entity_type,
         state_or_country_where_organized, attorney_name,
-        correspondent_name_address, earliest_date_can_be_filed,
+        correspondent_name_address, correspondent_email, earliest_date_can_be_filed,
         latest_date_without_additional_fee
     FROM trademarks
     WHERE mark ILIKE ?
@@ -226,7 +226,7 @@ def query_by_registration_date(start_date, end_date, chunk_size=4000):
         status_code, status_date, for_goods_services, international_classes,
         owner_name, owner_address, legal_entity_type,
         state_or_country_where_organized, attorney_name,
-        correspondent_name_address, earliest_date_can_be_filed,
+        correspondent_name_address, correspondent_email, earliest_date_can_be_filed,
         latest_date_without_additional_fee
     FROM trademarks
     WHERE registration_date BETWEEN TRY_CAST(? AS DATE) AND TRY_CAST(? AS DATE)
