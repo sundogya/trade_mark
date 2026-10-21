@@ -4,9 +4,11 @@ import os
 import sys
 import glob
 import tarfile
+from datetime import datetime, date
 import requests
 from bs4 import BeautifulSoup
 import duckdb
+import pandas as pd
 from huggingface_hub import hf_hub_download
 
 # 兼容 PyInstaller 打包后的真实 exe 所在目录
@@ -129,9 +131,7 @@ def export_df_to_chunked_csv(df, prefix_name, chunk_size=4000):
     print(f"\n 全部 CSV 已成功保存至目录: {CSV_DIR}")
 
 def query_by_serial_range(start_val, end_val, chunk_size=4000):
-    """
-    选项 1：根据申请号范围检索
-    """
+    """选项 1：根据申请号范围检索"""
     con, err = get_duckdb_connection()
     if err:
         print(f"❌ 连接错误: {err}")
@@ -164,9 +164,7 @@ def query_by_serial_range(start_val, end_val, chunk_size=4000):
         con.close()
 
 def query_by_mark_keyword(keyword, chunk_size=4000):
-    """
-    选项 2：根据商标名称关键字模糊检索 (不区分大小写)
-    """
+    """选项 2：根据商标名称关键字模糊检索 (不区分大小写)"""
     con, err = get_duckdb_connection()
     if err:
         print(f"❌ 连接错误: {err}")
@@ -193,11 +191,8 @@ def query_by_mark_keyword(keyword, chunk_size=4000):
     ORDER BY us_serial_number ASC;
     """
     try:
-        # 使用 ILIKE 进行全词包含匹配
         df = con.execute(query, [f"%{kw}%"]).df()
         print(f" 检索完成，共找到 {len(df)} 条包含 [{kw}] 的商标记录！\n")
-        
-        # 安全处理文件名字符
         safe_kw = "".join([c for c in kw if c.isalnum() or c in (' ', '_', '-')]).strip()
         export_df_to_chunked_csv(df, f"mark_{safe_kw}", chunk_size)
     except Exception as e:
@@ -206,9 +201,7 @@ def query_by_mark_keyword(keyword, chunk_size=4000):
         con.close()
 
 def query_by_registration_date(start_date, end_date, chunk_size=4000):
-    """
-    选项 3：根据注册日期范围检索
-    """
+    """选项 3：根据注册日期范围检索"""
     con, err = get_duckdb_connection()
     if err:
         print(f"❌ 连接错误: {err}")
@@ -242,6 +235,7 @@ def query_by_registration_date(start_date, end_date, chunk_size=4000):
         con.close()
 
 def getText(html, text=''):
+    """按匹配文本提取下一个 div 的文本内容"""
     tag = html.find('div', string=text)
     if bool(tag):
         tag = tag.find_next('div')
@@ -250,98 +244,237 @@ def getText(html, text=''):
         res = tag.text.strip().replace('\r', '').replace('\n', ' ').replace('\t', '')
     return res
 
+def add_years_safe(d: date, years: int) -> date:
+    """安全为日期增加年数（兼容闰年 2月29日）"""
+    try:
+        return d.replace(year=d.year + years)
+    except ValueError:
+        return d.replace(month=2, day=28, year=d.year + years)
+
+def parse_date_safely(date_str):
+    """解析日期字符串为 date 对象，兼容带点号的英文月份 (如 Apr. 15, 2025)"""
+    if not date_str:
+        return None
+    # 去除首尾空格，并将月份缩写后的英文点号 '.' 去掉 (例如 'Apr.' -> 'Apr')
+    clean_str = date_str.strip().replace('.', '')
+    
+    # 增加更多常见的兼容格式
+    for fmt in (
+        "%b %d, %Y",   # Apr 15, 2025
+        "%B %d, %Y",   # April 15, 2025
+        "%Y-%m-%d",   # 2025-04-15
+        "%m/%d/%Y",   # 04/15/2025
+        "%d-%b-%Y",   # 15-Apr-2025
+        "%Y/%m/%d"    # 2025/04/15
+    ):
+        try:
+            return datetime.strptime(clean_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+def fetch_single_trademark_data(sn):
+    """
+    网络抓取单条商标并计算宣誓日期的底层解析函数
+    遵循 aaa.py 的节奏，请求后固定等待 3 秒
+    """
+    sn = sn.strip()
+    if not sn:
+        return None
+
+    url = f'https://tsdr.uspto.gov/statusview/sn{sn}'
+    headers_agent = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    
+    try:
+        page = requests.get(url, headers=headers_agent, timeout=15)
+        print(f"[{sn}] 请求状态码: {page.status_code}")
+
+        if page.status_code != 200:
+            print(f"⚠️ [{sn}] 页面拉取未成功 (HTTP {page.status_code})")
+            time.sleep(3)  # 对齐 aaa.py 的 3 秒休眠逻辑
+            return None
+
+        html = BeautifulSoup(page.text, 'html.parser')
+
+        mark = getText(html, 'Mark:')
+        reg_num = getText(html, 'US Registration Number:')
+        reg_dt_raw = getText(html, 'Registration Date:')
+        status_dt = getText(html, 'Status Date:')
+        pub_dt = getText(html, 'Publication Date:')
+        for_goods = getText(html, 'For:')
+        intl_class = getText(html, 'International Class(es):')
+        own_name = getText(html, 'Owner Name:')
+        own_addr = getText(html, 'Owner Address:')
+        legal_type = getText(html, 'Legal Entity Type:')
+        citizenship = getText(html, 'Citizenship:')
+        corr_addr = getText(html, 'Correspondent Name/Address:')
+        corr_email = getText(html, 'Correspondent e-mail:')
+        corr_email_auth = getText(html, 'Correspondent e-mail Authorized:')
+
+        # 宣誓日期计算推导
+        reg_date_obj = parse_date_safely(reg_dt_raw)
+        earliest_date_str = None
+        latest_date_str = None
+
+        if reg_date_obj:
+            earliest_date_str = add_years_safe(reg_date_obj, 5).strftime("%Y-%m-%d")
+            latest_date_str = add_years_safe(reg_date_obj, 6).strftime("%Y-%m-%d")
+            reg_dt_formatted = reg_date_obj.strftime("%Y-%m-%d")
+        else:
+            reg_dt_formatted = reg_dt_raw
+
+        data_dict = {
+            "mark": mark,
+            "us_serial_number": sn,
+            "us_registration_number": reg_num,
+            "registration_date": reg_dt_formatted,
+            "status_date": status_dt,
+            "publication_date": pub_dt,
+            "for_goods_services": for_goods,
+            "international_classes": intl_class,
+            "owner_name": own_name,
+            "owner_address": own_addr,
+            "legal_entity_type": legal_type,
+            "state_or_country_where_organized": citizenship,
+            "correspondent_name_address": corr_addr,
+            "correspondent_email": corr_email,
+            "correspondent_email_authorized": corr_email_auth,
+            "earliest_date_can_be_filed": earliest_date_str,
+            "latest_date_without_additional_fee": latest_date_str
+        }
+
+        # 严格执行 aaa.py 中的 3 秒休眠逻辑
+        time.sleep(3)
+        return data_dict
+
+    except Exception as e:
+        print(f"❌ [{sn}] 抓取异常: {e}")
+        time.sleep(3)
+        return None
+
 def update_duckdb_trademarks(serial_numbers):
     """
-    选项 4：在线抓取并更新指定商标
+    选项 4：在线抓取并回写更新指定商标进 DuckDB
     """
     db_files = sorted(glob.glob(os.path.join(DB_DIR, "*.duckdb")))
     if not db_files:
         print(f"❌ 找不到数据库文件，无法更新")
         return
 
-    # 针对分卷库更新：默认写入最新/最后一个分卷，或首个匹配分卷
     target_db = db_files[-1]
     con = duckdb.connect(target_db)
-    updated_count = 0
+    
+    # 自动补充字段结构
+    try:
+        con.execute("ALTER TABLE trademarks ADD COLUMN IF NOT EXISTS earliest_date_can_be_filed DATE;")
+        con.execute("ALTER TABLE trademarks ADD COLUMN IF NOT EXISTS latest_date_without_additional_fee DATE;")
+    except Exception:
+        pass
 
-    print(f"\n准备在线刷新并更新指定商标（写入目标库: {os.path.basename(target_db)}）...")
+    updated_count = 0
+    print(f"\n准备在线抓取并更新指定商标（写入目标分卷: {os.path.basename(target_db)}，请求间隔: 3 秒）...")
 
     for sn in serial_numbers:
-        sn = sn.strip()
-        if not sn:
+        item = fetch_single_trademark_data(sn)
+        if not item:
             continue
-        try:
-            url = f'https://tsdr.uspto.gov/statusview/sn{sn}'
-            headers_agent = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            page = requests.get(url, headers=headers_agent, timeout=15)
-            print(f"[{sn}] 请求状态码: {page.status_code}")
 
-            if page.status_code == 200:
-                html = BeautifulSoup(page.text, 'html.parser')
+        con.execute("""
+        INSERT OR REPLACE INTO trademarks (
+            mark,
+            us_serial_number,
+            us_registration_number,
+            registration_date,
+            status_date,
+            publication_date,
+            for_goods_services,
+            international_classes,
+            owner_name,
+            owner_address,
+            legal_entity_type,
+            state_or_country_where_organized,
+            correspondent_name_address,
+            correspondent_email,
+            correspondent_email_authorized,
+            earliest_date_can_be_filed,
+            latest_date_without_additional_fee
+        ) VALUES (
+            ?, ?, ?, TRY_CAST(? AS DATE), TRY_CAST(? AS DATE), TRY_CAST(? AS DATE),
+            ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            TRY_CAST(? AS DATE), TRY_CAST(? AS DATE)
+        );
+        """, [
+            item["mark"], item["us_serial_number"], item["us_registration_number"],
+            item["registration_date"], item["status_date"], item["publication_date"],
+            item["for_goods_services"], item["international_classes"], item["owner_name"],
+            item["owner_address"], item["legal_entity_type"], item["state_or_country_where_organized"],
+            item["correspondent_name_address"], item["correspondent_email"], item["correspondent_email_authorized"],
+            item["earliest_date_can_be_filed"], item["latest_date_without_additional_fee"]
+        ])
 
-                mark = getText(html, 'Mark:')
-                reg_num = getText(html, 'US Registration Number:')
-                status_dt = getText(html, 'Status Date:')
-                pub_dt = getText(html, 'Publication Date:')
-                for_goods = getText(html, 'For:')
-                intl_class = getText(html, 'International Class(es):')
-                own_name = getText(html, 'Owner Name:')
-                own_addr = getText(html, 'Owner Address:')
-                legal_type = getText(html, 'Legal Entity Type:')
-                citizenship = getText(html, 'Citizenship:')
-                corr_addr = getText(html, 'Correspondent Name/Address:')
-                corr_email = getText(html, 'Correspondent e-mail:')
-                corr_email_auth = getText(html, 'Correspondent e-mail Authorized:')
-
-                con.execute("""
-                INSERT OR REPLACE INTO trademarks (
-                    mark,
-                    us_serial_number,
-                    us_registration_number,
-                    status_date,
-                    publication_date,
-                    for_goods_services,
-                    international_classes,
-                    owner_name,
-                    owner_address,
-                    legal_entity_type,
-                    state_or_country_where_organized,
-                    correspondent_name_address,
-                    correspondent_email,
-                    correspondent_email_authorized
-                ) VALUES (
-                    ?, ?, ?, TRY_CAST(? AS DATE), TRY_CAST(? AS DATE),
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?
-                );
-                """, [
-                    mark, sn, reg_num, status_dt, pub_dt,
-                    for_goods, intl_class, own_name, own_addr, legal_type,
-                    citizenship, corr_addr, corr_email, corr_email_auth
-                ])
-
-                print(f" [{sn}] 已更新入库: Mark={mark}, For={for_goods[:30]}...")
-                updated_count += 1
-            else:
-                print(f"⚠️ [{sn}] 页面拉取未成功 (HTTP {page.status_code})")
-
-            time.sleep(1.5)
-        except Exception as e:
-            print(f"❌ [{sn}] 更新异常: {e}")
+        print(f" [{item['us_serial_number']}] 已成功更新入库: Mark={item['mark']}, 宣誓起始={item['earliest_date_can_be_filed'] or '未注册'}, 截止={item['latest_date_without_additional_fee'] or '未注册'}")
+        updated_count += 1
 
     con.execute("CHECKPOINT;")
     con.close()
     print(f"\n全部执行完毕！成功更新回写 DuckDB: {updated_count} 条。")
+
+def fetch_and_export_to_csv(serial_numbers, prefix_name="crawled_trademarks", chunk_size=4000):
+    """
+    通用函数：在线抓取指定的序列号列表，导出至 CSV 文件
+    """
+    print(f"\n准备在线抓取数据并导出至 CSV（请求间隔: 3 秒，共 {len(serial_numbers)} 个待检测号码）...")
+    records = []
+
+    for idx, sn in enumerate(serial_numbers, 1):
+        item = fetch_single_trademark_data(sn)
+        if item:
+            records.append(item)
+            print(f" [{idx}/{len(serial_numbers)}] [{item['us_serial_number']}] 成功抓取: Mark={item['mark']}")
+
+    if not records:
+        print("❌ 未成功获取到任何有效商标数据，取消导出。")
+        return
+
+    df = pd.DataFrame(records)
+    export_df_to_chunked_csv(df, prefix_name, chunk_size)
+    print(f"🎉 在线抓取数据已成功导出！共计成功获取 {len(df)} 条。")
+
+def fetch_range_and_export_to_csv(start_val, end_val, chunk_size=4000):
+    """
+    选项 6：根据【申请号范围】在线抓取数据，计算宣誓日期后按 4000 条分组导出 CSV
+    """
+    try:
+        s_int = int(str(start_val).strip())
+        e_int = int(str(end_val).strip())
+    except ValueError:
+        print("❌ 起始和截止申请号必须为纯数字！")
+        return
+
+    if s_int > e_int:
+        print("❌ 起始申请号不能大于截止申请号！")
+        return
+
+    total_target = e_int - s_int + 1
+    print(f"\n已设定在线抓取区间: [{s_int}] ~ [{e_int}]，共计 {total_target} 个号码。")
+    
+    # 生成待抓取的申请号列表
+    serial_numbers = [str(i) for i in range(s_int, e_int + 1)]
+    prefix_name = f"crawled_sn_{s_int}_{e_int}"
+    fetch_and_export_to_csv(serial_numbers, prefix_name=prefix_name, chunk_size=chunk_size)
 
 # 命令行交互主入口
 if __name__ == "__main__":
     ensure_database_ready()
 
     choice = input('请选择操作模式：\n'
-                   '1、根据【申请号范围】检索并按 4000 条分组导出 CSV\n'
-                   '2、根据【商标名称关键字】检索并按 4000 条分组导出 CSV\n'
-                   '3、根据【注册日期范围】检索并按 4000 条分组导出 CSV\n'
-                   '4、从网络抓取最新数据并更新回写进 DuckDB\n'
-                   '请输入选项 (1/2/3/4): ').strip()
+                   '1、根据【申请号范围】检索本地库并按 4000 条分组导出 CSV\n'
+                   '2、根据【商标名称关键字】检索本地库并按 4000 条分组导出 CSV\n'
+                   '3、根据【注册日期范围】检索本地库并按 4000 条分组导出 CSV\n'
+                   '4、从网络抓取最新数据并更新回写进 DuckDB（每 3s 一次）\n'
+                   '5、从网络抓取指定商标并直接导出到 CSV 文件（每 3s 一次）\n'
+                   '6、根据【申请号范围】从网络在线抓取并按 4000 条分组导出 CSV（每 3s 一次）\n'
+                   '请输入选项 (1/2/3/4/5/6): ').strip()
 
     if choice == '1':
         start = input('请输入起始申请号（如 90000000）: \n').strip()
@@ -359,8 +492,19 @@ if __name__ == "__main__":
 
     elif choice == '4':
         data = input('请输入需要在线更新的商标申请号（多个用英文逗号隔开，如 98689327,90007611）: \n').strip()
-        rows = data.split(',')
+        rows = [sn.strip() for sn in data.split(',') if sn.strip()]
         update_duckdb_trademarks(rows)
+
+    elif choice == '5':
+        data = input('请输入需要抓取导出的商标申请号（多个用英文逗号隔开，如 98689327,90007611）: \n').strip()
+        rows = [sn.strip() for sn in data.split(',') if sn.strip()]
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fetch_and_export_to_csv(rows, prefix_name=f"crawled_custom_{timestamp_str}", chunk_size=4000)
+
+    elif choice == '6':
+        start = input('请输入起始申请号（如 90000000）: \n').strip()
+        end = input('请输入截止申请号（如 90005000）: \n').strip()
+        fetch_range_and_export_to_csv(start, end, chunk_size=4000)
 
     else:
         print("无效选项，退出程序。")
