@@ -3,3 +3,6 @@ uspto_trademarks*
 .venv
 .DS_Store
 csv
+env.yaml
+*.duckdb
+.env
