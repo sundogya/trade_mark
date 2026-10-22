@@ -4,22 +4,33 @@ import time
 import random
 import queue
 import threading
+import zoneinfo
+from datetime import datetime
 import requests
 import duckdb
 import yaml
 import pandas as pd
 
 # =====================================================================
-# 1. 配置 Serverless 厂商网关
+# 1. 配置 Serverless 厂商网关与时区控制
 # =====================================================================
 with open("env.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
+
+# 读取 keychain 密钥配置
+KEYCHAIN = config.get("keychain", "")
+DEFAULT_HEADERS = {
+    "x-auth-kimball": str(KEYCHAIN)
+} if KEYCHAIN else {}
+
+if KEYCHAIN:
+    print(f"🔑 已加载 Keychain 鉴权密钥，将在请求中附带 x-auth-kimball 标头")
 
 # 只提取开启了 enabled: true 的节点
 active_nodes = [item for item in config.get("gateways", []) if item.get("enabled", True)]
 GATEWAYS = [item["url"] for item in active_nodes]
 
-# 同时直接生成名字映射字典，连写正则/判断域名都省了
+# 同时直接生成名字映射字典
 GATEWAY_NAMES = {item["url"]: item["name"] for item in active_nodes}
 print(f"🔗 已启用 {len(GATEWAYS)} 个网关节点: {list(GATEWAY_NAMES.values())}")
 
@@ -31,12 +42,33 @@ CSV_DIR = "./csv"  # CSV 存放目录
 db_lock = threading.Lock()
 print_lock = threading.Lock()
 
+# 美东时区 (自动兼容夏令时/冬令时)
+EASTERN_TZ = zoneinfo.ZoneInfo("America/New_York")
+
 def safe_log(msg):
     with print_lock:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
 def get_gateway_display_name(url):
     return GATEWAY_NAMES.get(url, "CustomGateway")
+
+def wait_if_in_us_business_hours():
+    """
+    检查美东时间：如果在早上 09:00 到下午 17:00 之间，则阻塞休眠直到 17:00
+    """
+    while True:
+        now_et = datetime.now(EASTERN_TZ)
+        hour = now_et.hour
+        # 9点到17点（包含 09:00:00 到 16:59:59）
+        if 9 <= hour < 17:
+            with print_lock:
+                print(f"\n⏸️ [时段避让] 当前美东时间为 {now_et.strftime('%Y-%m-%d %H:%M:%S')} (处于高峰期 09:00 ~ 17:00)")
+                print(f"⏳ 任务暂停中，所有 Gateway 已就地挂起，避免高峰期拥堵与 500 报错...")
+            
+            # 每隔 5 分钟检查一次，避免空转
+            time.sleep(300)
+        else:
+            break
 
 # =====================================================================
 # 2. 单个网关工作线程任务
@@ -46,7 +78,7 @@ def worker_task(gw_idx, gateway_url, initial_targets, backlog_queue, con):
     safe_log(f"🟢 节点 [{gw_name}] 启动，分配初始任务量: {len(initial_targets)} 条")
 
     consecutive_fail = 0
-    MAX_CONSECUTIVE_FAIL = 3  # 连续 3 次 429 或 403 触发熔断保护
+    MAX_CONSECUTIVE_FAIL = 3  # 单节点连续 3 次 429 或 403 触发自身下线保护
     gateway_healthy = True
 
     # 本线程私有数据缓冲，格式: (sn, correspondent_email, attorney_email)
@@ -67,8 +99,12 @@ def worker_task(gw_idx, gateway_url, initial_targets, backlog_queue, con):
 
     # 阶段一：处理初始分配的任务组
     for i, sn in enumerate(initial_targets):
+        # 每次发包前检查美东时间，如果在 09:00~17:00 则暂停等待
+        wait_if_in_us_business_hours()
+
         try:
-            resp = requests.get(gateway_url, params={"sn": sn}, timeout=15)
+            # 在请求中带上 x-auth-kimball 鉴权 Header
+            resp = requests.get(gateway_url, params={"sn": sn}, headers=DEFAULT_HEADERS, timeout=15)
             
             if resp.status_code == 200:
                 consecutive_fail = 0
@@ -81,6 +117,9 @@ def worker_task(gw_idx, gateway_url, initial_targets, backlog_queue, con):
             elif resp.status_code in (429, 403):
                 consecutive_fail += 1
                 safe_log(f"⚠️ [{gw_name}] 申请号: {sn} 遭遇状态码 {resp.status_code} (连续 {consecutive_fail}/{MAX_CONSECUTIVE_FAIL})")
+            elif resp.status_code == 500:
+                safe_log(f"❌ [{gw_name}] 申请号: {sn} 遭遇 500 服务器错误，任务回收待重试")
+                backlog_queue.put(sn)  # 回收防止数据丢失
             else:
                 safe_log(f"❌ [{gw_name}] 申请号: {sn} 状态异常 ({resp.status_code})")
         except Exception as e:
@@ -90,9 +129,9 @@ def worker_task(gw_idx, gateway_url, initial_targets, backlog_queue, con):
         if len(local_buffer) >= 20:
             flush_buffer()
 
-        # 触发熔断判定：如果该网关持续 429 / 403
+        # 触发自身 429/403 熔断判定
         if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
-            safe_log(f"🚫 [{gw_name}] 触发连续阻断熔断！放弃当前网关，回收剩余任务至公共队列...")
+            safe_log(f"🚫 [{gw_name}] 触发频控/阻断熔断！放弃当前网关，回收剩余任务至公共队列...")
             gateway_healthy = False
             
             remaining_items = initial_targets[i:]
@@ -100,22 +139,25 @@ def worker_task(gw_idx, gateway_url, initial_targets, backlog_queue, con):
                 backlog_queue.put(rem_sn)
             break
 
-        # 保持健康间隔（2.0 ~ 3.5 秒）
-        time.sleep(random.uniform(2.0, 3.5))
+        time.sleep(random.uniform(3, 5))
 
     flush_buffer()
 
-    # 阶段二：如果本节点依然健康，继续帮忙消化从坏节点回退出来的任务
+    # 阶段二：若本节点健康，接管公共后备队列任务
     if gateway_healthy:
         safe_log(f"✅ [{gw_name}] 自身初始任务已跑完，检查公共后备队列...")
         while True:
+            # 同样在接管取任务前做时段检查
+            wait_if_in_us_business_hours()
+
             try:
                 sn = backlog_queue.get_nowait()
             except queue.Empty:
                 break
 
             try:
-                resp = requests.get(gateway_url, params={"sn": sn}, timeout=15)
+                # 在接管请求中同样带上 x-auth-kimball 鉴权 Header
+                resp = requests.get(gateway_url, params={"sn": sn}, headers=DEFAULT_HEADERS, timeout=15)
                 if resp.status_code == 200:
                     consecutive_fail = 0
                     data = resp.json()
@@ -131,6 +173,12 @@ def worker_task(gw_idx, gateway_url, initial_targets, backlog_queue, con):
                     if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
                         safe_log(f"🚫 [{gw_name}] 在接管任务期间触发熔断，退出工作。")
                         break
+                elif resp.status_code == 500:
+                    safe_log(f"❌ [{gw_name} 接管时] 申请号: {sn} 遭遇 500 错误，任务重回队列")
+                    backlog_queue.put(sn)
+                else:
+                    safe_log(f"❌ [{gw_name} 接管时] 申请号: {sn} 状态异常 ({resp.status_code})，任务重回队列")
+                    backlog_queue.put(sn)
             except Exception as e:
                 backlog_queue.put(sn)
                 safe_log(f"❌ [{gw_name} 接管时] 异常: {e}，任务重回队列")
@@ -138,7 +186,7 @@ def worker_task(gw_idx, gateway_url, initial_targets, backlog_queue, con):
             if len(local_buffer) >= 20:
                 flush_buffer()
 
-            time.sleep(random.uniform(2.0, 3.5))
+            time.sleep(random.uniform(3, 5))
 
         flush_buffer()
 
@@ -154,7 +202,7 @@ def run_pipeline(all_targets, batch_size=BATCH_SIZE):
 
     con = duckdb.connect(DB_PATH)
     
-    # 1. 初始化表（若表已存在，自动添加 attorney_email 字段）
+    # 1. 初始化表（若表已存在，自动补齐字段）
     con.execute("""
     CREATE TABLE IF NOT EXISTS email_patch (
         serial_no VARCHAR PRIMARY KEY,
@@ -182,12 +230,15 @@ def run_pipeline(all_targets, batch_size=BATCH_SIZE):
         con.close()
         return True
 
-    print(f"⚙️ 批次策略: 每处理 {batch_size} 条进入一次 5~10 分钟深度冷却，防止 IP 触发 403 封锁")
+    print(f"⚙️ 批次策略: 每处理 {batch_size} 条进入一次 5~8 分钟深度冷却，防止 IP 触发阻断")
 
     remaining_targets = list(filtered_targets)
     batch_num = 1
 
     while remaining_targets:
+        # 启动批次前先检查时区，若在避让窗口内则提前等待
+        wait_if_in_us_business_hours()
+
         current_batch = remaining_targets[:batch_size]
         remaining_targets = remaining_targets[batch_size:]
 
@@ -217,6 +268,7 @@ def run_pipeline(all_targets, batch_size=BATCH_SIZE):
         for t in threads:
             t.join()
 
+        # 回收因各种熔断未完成的任务
         leftovers = []
         while not backlog_queue.empty():
             try:
@@ -225,7 +277,7 @@ def run_pipeline(all_targets, batch_size=BATCH_SIZE):
                 break
 
         if leftovers:
-            safe_log(f"⚠️ 本批次有 {len(leftovers)} 条任务因节点熔断未完成，已回收至待处理队列。")
+            safe_log(f"⚠️ 本批次有 {len(leftovers)} 条任务因节点熔断/异常未完成，已回收至待处理队列。")
             remaining_targets = leftovers + remaining_targets
 
         end_count = con.execute("SELECT COUNT(*) FROM email_patch;").fetchone()[0]
@@ -233,10 +285,10 @@ def run_pipeline(all_targets, batch_size=BATCH_SIZE):
         print(f"🎉 第 {batch_num} 批次执行完成！本批新增入库: {batch_new_saved} 条，当前数据库累计: {end_count} 条。")
 
         if remaining_targets:
-            rest_seconds = random.uniform(4 * 60, 6 * 60)
+            rest_seconds = random.uniform(5 * 60, 8 * 60)
             rest_minutes = rest_seconds / 60
-            print(f"\n😴 【深度保护期】已完成一批数据，脚本全局断流休眠 {rest_minutes:.1f} 分钟 ({int(rest_seconds)} 秒)...")
-            print(f"⏳ 正在冷却远端 WAF/Akamai 滑动计数器，请勿中断程序...")
+            print(f"\n😴 【批次休眠期】已完成一批数据，脚本全局断流休眠 {rest_minutes:.1f} 分钟 ({int(rest_seconds)} 秒)...")
+            print(f"⏳ 正在冷却远端 WAF 滑动计数器，请勿中断程序...")
             time.sleep(rest_seconds)
             batch_num += 1
 
@@ -258,7 +310,6 @@ if __name__ == "__main__":
         print(f"📁 未检测到 {CSV_DIR} 目录，已自动创建。请放入待抓取的 CSV 文件后重新运行。")
         exit(0)
 
-    # 扫描目录下所有的 csv 文件并自然排序
     csv_files = sorted(glob.glob(os.path.join(CSV_DIR, "*.csv")))
 
     if not csv_files:
@@ -277,13 +328,11 @@ if __name__ == "__main__":
 
         try:
             df = pd.read_csv(fpath)
-            # 兼容两种常见列名格式
             if 'us_serial_number' in df.columns:
                 targets = df['us_serial_number'].dropna().astype(str).tolist()
             elif 'serial_no' in df.columns:
                 targets = df['serial_no'].dropna().astype(str).tolist()
             else:
-                # 若两列都不存在，默认读取第一列
                 first_col = df.columns[0]
                 print(f"⚠️ 未找到 'us_serial_number' 或 'serial_no' 列，自动使用首列 [{first_col}]")
                 targets = df[first_col].dropna().astype(str).tolist()
@@ -293,12 +342,11 @@ if __name__ == "__main__":
                 os.remove(fpath)
                 continue
 
-            # 启动抓取并写入数据库
             success = run_pipeline(targets)
 
-            # 运行成功后，安全删除该 csv 文件
             if success:
                 os.remove(fpath)
+                time.sleep(60*2)  # 删除后等待 2 分钟，确保文件系统稳定
                 print(f"🗑️ 文件 {file_name} 已处理入库完毕，源 CSV 文件已成功删除。")
 
         except Exception as e:
