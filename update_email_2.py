@@ -61,12 +61,15 @@ def wait_if_in_us_business_hours():
         current_hour_float = now_et.hour + now_et.minute / 60.0
         # 7.5点到16.5点（包含 07:30:00 到 16:29:59）
         if 7.5 <= current_hour_float < 16.5:
-            with print_lock:
-                print(f"\n⏸️ [时段避让] 当前美东时间为 {now_et.strftime('%Y-%m-%d %H:%M:%S')} (处于高峰期 07:30 ~ 16:30)")
-                print(f"⏳ 任务暂停中，所有 Gateway 已就地挂起，避免高峰期拥堵与 500 报错...")
-            
-            # 每隔 5 分钟检查一次，避免空转
-            time.sleep(300)
+            if now_et.weekday() >= 5:  # 周六周日不阻塞
+                break
+            else:
+                with print_lock:
+                    print(f"\n⏸️ [时段避让] 当前美东时间为 {now_et.strftime('%Y-%m-%d %H:%M:%S')} (处于高峰期 07:30 ~ 16:30)")
+                    print(f"⏳ 任务暂停中，所有 Gateway 已就地挂起，避免高峰期拥堵与 500 报错...")
+                
+                # 每隔 5 分钟检查一次，避免空转
+                time.sleep(300)
         else:
             break
 
